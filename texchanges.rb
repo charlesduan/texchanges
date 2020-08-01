@@ -46,7 +46,7 @@ class IndexedString
     current = 0
     each_mark do |range, marks|
       yield(@str[current...range.first], marks, @str[range])
-      current = pos
+      current = range.first
     end
     if current < @str.length - 1
       yield(@str[current..-1], [], "")
@@ -88,6 +88,11 @@ class IndexedString
     pos = @str.length
     (@indexes[pos...pos] ||= []).push(obj)
     return self
+  end
+
+  def mark_at(pos, obj)
+    raise "Invalid position" if pos < 0 or pos > @str.length
+    (@indexes[pos...pos] ||= []).push(obj)
   end
 
   def mark_range(obj)
@@ -295,6 +300,10 @@ class WordEdit
     @pre_edit, @post_edit = EditInterpreter.new(word_file).parse_multiple(marks)
   end
 
+  def edit_id
+    @marks[0]['w:id']
+  end
+
   attr_reader :word_file, :range, :marks, :token, :etoken, :pre_edit, :post_edit
 
   def context_string(t = nil, et = nil)
@@ -308,9 +317,9 @@ class WordEdit
     text = @word_file.document_string[t.pos .. et.end_pos]
     offset_range = @range - t.pos
     if @pre_edit.nil?
-      text[offset_range] = "-<#{text[offset_range]}>-"
+      text[offset_range] = "-<<#{text[offset_range]}>>-"
     else
-      text[offset_range] = "+<#@pre_edit#{text[offset_range]}#@post_edit>+"
+      text[offset_range] = "+<<#@pre_edit#{text[offset_range]}#@post_edit>>+"
     end
     return text
   end
@@ -564,12 +573,20 @@ class EditInterpreter < DocxParser
   }
 
   IGNORE_STYLES = %w(
+    Footnote
     FootnoteReference
     FootnoteText
     CommentText
     CommentReference
     Hyperlink
   )
+
+  STYLES = {
+    'textit' => %w(\emph{ }),
+    'Emphasis' => %w(\emph{ }),
+    'textbf' => %w(\textbf{ }),
+    'textsc' => %w(\textsc{ }),
+  }
 
   def read_properties(node)
     notes, adds = [], []
@@ -578,6 +595,8 @@ class EditInterpreter < DocxParser
     }.each do |x|
       if PROPERTIES[x.name]
         adds.push(PROPERTIES[x.name])
+      elsif %w(rStyle pStyle).include?(x.name) && STYLES.include?(x['w:val'])
+        adds.push(STYLES[x['w:val']]) unless adds.include?(STYLES[x['w:val']])
       elsif %w(rStyle pStyle).include?(x.name) &&
         IGNORE_STYLES.include?(x['w:val'])
       else
@@ -595,11 +614,28 @@ class EditInterpreter < DocxParser
     return [ res, trail ]
   end
 
+  TEX_CONVERTS = {
+    "“" => "``",
+    "”" => "''",
+    "‘" => "`",
+    "’" => "'",
+    "–" => "--",
+    "—" => "---",
+    "~" => "\\textasciitilde ",
+    "\\" => "\\textbackslash ",
+    "%" => "\\%",
+    "{" => "\\{",
+    "}" => "\\}",
+    "#" => "\\#",
+    "$" => "\\$",
+    "&" => "\\&",
+    "_" => "\\_",
+    "^" => "\\^{}",
+  }
   def tex_escape(text)
-    text = text.gsub(/\\/, "\\textbackslash")                 
-    text = text.gsub(/[%{}]/) { "\\#$&" }                       
-    text = text.gsub(/[#\$^&_]/) { "\\#$&" }                  
-    text = text.gsub(/~/, "\\textasciitilde")                 
+    TEX_CONVERTS.each do |from, to|
+      text = text.gsub(from, to)
+    end
     return text
   end
 
@@ -694,10 +730,12 @@ class TeXFile
   def initialize(file)
     @file = file
     @parsed_text = IndexedString.new
+    @edited = false
     parse
   end
 
-  attr_accessor :file, :parsed_text
+  attr_accessor :file, :parsed_text, :tokenizer
+  attr_accessor :edited
 
   BRACE_RE = /(?<brace>\{(?:[^{}]|\g<brace>)*\})/
   TEX_BOUNDARY = /(?:\{|\}|\\[A-Za-z]+\b\s*|(?<!\\)%.*\n)+/
@@ -708,14 +746,41 @@ class TeXFile
     while m = TEX_BOUNDARY.match(text)
       @parsed_text << m.pre_match
       if m.to_s =~ /\\(?:footnote|note|cn)\b/
+        @parsed_text.mark("START DELETE")
         @parsed_text << ' '
-        @parsed_text.mark("\b")
+        @parsed_text.mark("END DELETE")
       end
       @parsed_text.mark(m.to_s)
       text = m.post_match
     end
     @parsed_text << text
   end
+
+  def tokenize
+    @tokenizer = NgramTokenizer.new(@parsed_text.to_s)
+  end
+
+  def write(new_filename)
+    text = ""
+    delete_count = 0
+    @parsed_text.each do |str, marks, text_range|
+      raise "Not expecting text range in TeX file" unless text_range.empty?
+      text << (str) if delete_count <= 0
+      marks.each do |mark|
+        case mark
+        when "START DELETE" then delete_count += 1
+        when "END DELETE"   then delete_count -= 1
+        when /\AINSERT /    then text << $'
+        else                     text << mark if delete_count <= 0
+        end
+      end
+    end
+    text.gsub!(/\s*(?:\\par\s+)+/, "\n\n")
+    File.open(new_filename, 'w') do |io|
+      io.write(text)
+    end
+  end
+
 end
 
 ########################################################################
@@ -726,47 +791,47 @@ end
 # the start and end output tokens.
 #
 class TokenMatch
-  attr_accessor :input_start_token, :input_end_token, :output_start_token,
-    :output_end_token, :output_file
+  attr_accessor :word_start_token, :word_end_token, :tex_start_token,
+    :tex_end_token, :tex_file
 
   def set_start(input, output, file)
     raise "set_end: expected Token" unless input.is_a?(Token)
     raise "set_end: expected Token" unless output.is_a?(Token)
-    @input_start_token, @output_start_token, @output_file = input, output,
+    @word_start_token, @tex_start_token, @tex_file = input, output,
       file
     return true
   end
   def set_end(input, output, file)
     raise "set_end: expected Token" unless input.is_a?(Token)
     raise "set_end: expected Token" unless output.is_a?(Token)
-    return false unless file == @output_file
-    return false unless input.pos >= @input_start_token.pos
-    return false unless output.pos >= @output_start_token.pos
-    @input_end_token, @output_end_token = input, output
+    return false unless file == @tex_file
+    return false unless input.pos >= @word_start_token.pos
+    return false unless output.pos >= @tex_start_token.pos
+    @word_end_token, @tex_end_token = input, output
     return true
   end
 
-  def input_range
-    return (input_start_token.pos) .. (input_end_token.end_pos)
+  def word_range
+    return (word_start_token.pos) .. (word_end_token.end_pos)
   end
 
-  def input_array
-    return @input_start_token.array(input_end_token)
+  def word_array
+    return @word_start_token.array(word_end_token)
   end
 
   def modify_input(text, range)
-    context = text[@input_start_token.pos .. @input_end_token.end_pos]
-    offset_range = range - @input_start_token.pos
+    context = text[@word_start_token.pos .. @word_end_token.end_pos]
+    offset_range = range - @word_start_token.pos
     context[offset_range] = yield(context[offset_range])
     return context
   end
 
-  def output_range
-    return (output_start_token.pos) .. (output_end_token.end_pos)
+  def tex_range
+    return (tex_start_token.pos) .. (tex_end_token.end_pos)
   end
 
-  def output_array
-    return output_start_token.array(output_end_token)
+  def tex_array
+    return tex_start_token.array(tex_end_token)
   end
 
   def match_pos(diff, pos)
@@ -783,18 +848,16 @@ class TokenMatch
 
 
   def match_range(start_pos, stop_pos)
-    diff = Diff::LCS.sdiff(input_array, output_array)
+    diff = Diff::LCS.sdiff(word_array, tex_array)
     start = match_pos(diff, start_pos)
     return start if start.is_a?(Token)
 
-    if stop_pos
-      if stop_pos == start_pos
-        return start ... start
-      else
-        stop = match_pos(diff, stop_pos)
-        return stop if stop.is_a?(Token)
-        return start ... stop
-      end
+    if stop_pos.nil? or stop_pos == start_pos
+      return start ... start
+    else
+      stop = match_pos(diff, stop_pos)
+      return stop if stop.is_a?(Token)
+      return start ... stop
     end
   end
 end
@@ -809,14 +872,11 @@ class TextMatcher
     @ngram_size = 5
   end
 
-  def input(memo, tokenizer)
+  def input(tex_file)
+    tokenizer = tex_file.tokenizer
     tokenizer.pad_tokens(@ngram_size)
     tokenizer.make_ngrams(@ngram_size) do |ngram|
-      if @ngrams[ngram]
-        @ngrams[ngram].push([ memo, ngram ])
-      else
-        @ngrams[ngram] = [ [ memo, ngram ] ]
-      end
+      (@ngrams[ngram] ||= []).push([ tex_file, ngram ])
     end
   end
 
@@ -845,20 +905,20 @@ class TextMatcher
     end
 
     range = tm.match_range(word_edit.range.begin, word_edit.range.end)
-    return TeXEdit.new(tm, range)
+    return TeXEdit.new(word_edit, tm, range)
   end
 
 end
 
 class TeXEdit
-  def initialize(token_match, range)
-    @token_match, @range = token_match, range
-    @file = @token_match.output_file
+  def initialize(word_edit, token_match, range)
+    @word_edit, @token_match, @range = word_edit, token_match, range
+    @file = @token_match.tex_file
   end
 
   def show_range_edit(pre, post)
-    context_range = @token_match.output_range
-    text = @token_match.output_file.parsed_text[context_range]
+    context_range = @token_match.tex_range
+    text = @token_match.tex_file.parsed_text[context_range]
     offset_range = @range - context_range.begin
     if pre.nil?
       text[offset_range] = "-<#{text[offset_range]}>-"
@@ -869,31 +929,81 @@ class TeXEdit
   end
 
   def show_token_edit
-    context_range = @token_match.output_range
-    text = @token_match.output_file.parsed_text[context_range]
+    context_range = @token_match.tex_range
+    text = @token_match.tex_file.parsed_text[context_range]
     offset = @range.pos - context_range.begin
     text[offset...offset] = "<<EDIT>>"
     return text
   end
 
 
-  def explain_edit(word_edit)
+  def explain_edit
+    text = "WEDIT#{@word_edit.edit_id}: #{@token_match.tex_file.file}\n"
     case @range
     when Token
-      return "Edit approximately here:\n\n" + show_token_edit +
+      return text + "Edit approximately here:\n\n" + show_token_edit +
         "\n\nOriginal word edit was:\n\n" +
-        word_edit.context_string(@token_match.input_start_token,
-                                 @token_match.input_end_token)
+        @word_edit.context_string(@token_match.word_start_token,
+                                 @token_match.word_end_token)
     when Range
-      return "Edit as follows:\n\n" +
-        show_range_edit(word_edit.pre_edit, word_edit.post_edit) +
+      return text + "Edit as follows:\n\n" +
+        show_range_edit(@word_edit.pre_edit, @word_edit.post_edit) +
         "\n\nOriginal word edit was:\n\n" +
-        word_edit.context_string(@token_match.input_start_token,
-                                 @token_match.input_end_token)
+        @word_edit.context_string(@token_match.word_start_token,
+                                 @token_match.word_end_token)
     else
       raise "Unexpected TeXEdit range #{tm}"
     end
   end
+
+  def do_edit
+    @token_match.tex_file.edited = true
+    case @range
+    when Token then do_approx_edit
+    when Range then do_exact_edit
+    else raise "Unexpected TeXEdit range #{tm}"
+    end
+  end
+
+  def do_exact_edit
+    tex_text = @token_match.tex_file.parsed_text
+    comment_pos = @range.begin
+    comment_pos -= 1 until 0 == comment_pos or tex_text[comment_pos - 1] == "\n"
+    tex_text.mark_at(comment_pos, "% WEDIT#{@word_edit.edit_id}\n")
+
+    if @word_edit.pre_edit.nil?
+      tex_text.mark_at(@range.begin, "START DELETE")
+      tex_text.mark_at(@range.end, "END DELETE")
+    else
+      tex_text.mark_at(
+        @range.begin, "INSERT " + @word_edit.pre_edit
+      )
+      tex_text.mark_at(
+        @range.end, "INSERT " + @word_edit.post_edit
+      )
+    end
+  end
+
+  def do_approx_edit
+    token = @range
+    indexed_string = @token_match.tex_file.parsed_text
+    tex_text = @token_match.tex_file.parsed_text
+    comment_pos = token.pos
+    comment_pos -= 1 until 0 == comment_pos or tex_text[comment_pos - 1] == "\n"
+    word_context = @word_edit.context_string(
+      @token_match.word_start_token, @token_match.word_end_token
+    )
+    word_context.gsub(/\s*\\par\s*\z/, "\n\n")
+
+    tex_text.mark_at(
+      comment_pos,
+      "%\n% WEDIT#{@word_edit.edit_id}\n" +
+      "% Approximately here, edit as follows:\n" +
+      wrap_lines(word_context, 72, "%   ") + "%\n"
+    )
+
+  end
+
 end
 
 
@@ -918,9 +1028,11 @@ word_file = WordFile.new(word_file)
 word_file.tokenize_document(5)
 
 text_matcher = TextMatcher.new(5)
-tex_files.each do |file|
+tex_files = tex_files.map do |file|
   f = TeXFile.new(file)
-  text_matcher.input(f, NgramTokenizer.new(f.parsed_text.to_s))
+  f.tokenize
+  text_matcher.input(f)
+  f
 end
 
 ei = EditInterpreter.new(word_file)
@@ -930,7 +1042,8 @@ word_file.each_edit do |word_edit|
   tex_edit = text_matcher.match(word_edit)
 
   if tex_edit
-    puts wrap_lines(tex_edit.explain_edit(word_edit))
+    tex_edit.do_edit
+    puts wrap_lines(tex_edit.explain_edit)
   else
     puts wrap_lines("Could not match edit:\n\n#{word_edit.context_string}")
   end
@@ -938,6 +1051,13 @@ word_file.each_edit do |word_edit|
     puts "----------"
     puts
 
+end
+
+
+tex_files.each do |file|
+  name = file.file
+  next unless file.edited
+  file.write(File.join(File.dirname(name), "new-" + File.basename(name)))
 end
 
 
